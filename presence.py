@@ -2,73 +2,90 @@ import asyncio
 import time
 from bleak import BleakScanner
 
-PHONE_ADDRESS = "30:BB:7D:4C:3E:5C"   # <-- your phone
-RSSI_TRIGGER = -70                    # closer = -60, farther = -80
-SEEN_TIMEOUT = 5                      # seconds since last seen
-SHUTDOWN_CONFIRM = 5                  # must be weak for 5sec before OFF
+PHONE_ADDRESS = "30:BB:7D:4C:3E:5C"
+
+# -------- FINAL PARAMETERS --------
+ENTER_RSSI = -85          # ENTER when close
+EXIT_RSSI = -88           # EXIT when clearly far
+EXIT_TIME = 10            # seconds (RSSI OR disappearance)
+SEEN_TIMEOUT = 2          # scan jitter tolerance
+SMOOTH_ALPHA = 0.3
+# ---------------------------------
 
 smoothRSSI = None
-lastSeen = 0
-ledState = False
-shutdownStart = None
+lastSeen = None
+present = False
+exitTimerRSSI = None
 
 
 async def presence_loop():
-    global smoothRSSI, lastSeen, ledState, shutdownStart
+    global smoothRSSI, lastSeen, present, exitTimerRSSI
 
     while True:
-        # discover + get advertisement data
         devices = await BleakScanner.discover(timeout=1, return_adv=True)
-
         now = time.time()
+
         rssi = None
 
-        # find our phone and read RSSI
-        for (device, adv) in devices.values():
+        for device, adv in devices.values():
             if device.address.upper() == PHONE_ADDRESS.upper():
                 rssi = adv.rssi
                 lastSeen = now
                 break
 
-        # smooth the RSSI
+        # Smooth RSSI only when beacon is seen
         if rssi is not None:
             if smoothRSSI is None:
                 smoothRSSI = rssi
             else:
-                smoothRSSI = smoothRSSI * 0.7 + rssi * 0.3
+                smoothRSSI = smoothRSSI * (1 - SMOOTH_ALPHA) + rssi * SMOOTH_ALPHA
 
-        # --------- DECISION LOGIC ---------
+        seen_age = float("inf") if lastSeen is None else (now - lastSeen)
 
-        # TURN ON
-        if (
-            (now - lastSeen) < SEEN_TIMEOUT
-            and smoothRSSI is not None
-            and smoothRSSI > RSSI_TRIGGER
-        ):
-            if not ledState:
-                ledState = True
-                shutdownStart = None
+        # ---------------- ENTER ----------------
+        if not present:
+            if (
+                seen_age < SEEN_TIMEOUT
+                and smoothRSSI is not None
+                and smoothRSSI > ENTER_RSSI
+            ):
+                present = True
+                exitTimerRSSI = None
                 on_action(smoothRSSI)
 
-        # TURN OFF (with confirmation delay)
+        # ---------------- EXIT -----------------
         else:
-            if ledState:
-                if shutdownStart is None:
-                    shutdownStart = now
-                elif (now - shutdownStart) > SHUTDOWN_CONFIRM:
-                    ledState = False
-                    shutdownStart = None
+            # Condition A: beacon disappeared
+            if seen_age > EXIT_TIME:
+                present = False
+                exitTimerRSSI = None
+                off_action()
+
+            # Condition B: RSSI very weak for long enough
+            elif smoothRSSI is not None and smoothRSSI < EXIT_RSSI:
+                if exitTimerRSSI is None:
+                    exitTimerRSSI = now
+                elif (now - exitTimerRSSI) > EXIT_TIME:
+                    present = False
+                    exitTimerRSSI = None
                     off_action()
+            else:
+                exitTimerRSSI = None  # signal recovered
+
+        # -------- DEBUG --------
+        seen_txt = "∞" if lastSeen is None else int(seen_age)
+        rssi_txt = "None" if smoothRSSI is None else int(smoothRSSI)
+        print(f"present={present}  seen={seen_txt}s  rssi={rssi_txt}")
 
         await asyncio.sleep(0.2)
 
 
 def on_action(rssi):
-    print(f"🟢 ENTER detected (RSSI={int(rssi)}) → AMBIENCE ON")
+    print(f"🟢 ENTER → ambience ON (RSSI={int(rssi)})")
 
 
 def off_action():
-    print("🔴 LEFT detected → AMBIENCE OFF")
+    print("🔴 LEFT → ambience OFF")
 
 
 asyncio.run(presence_loop())
